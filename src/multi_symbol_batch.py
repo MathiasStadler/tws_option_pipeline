@@ -183,6 +183,80 @@ def filter_by_delta(rows, min_delta=-0.50, max_delta=-0.10):
     return [r for r in rows if r['delta'] is not None and min_delta <= r['delta'] <= max_delta]
 
 
+def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', limit_price=None, auto_transmit=False):
+    """
+    Platziert eine Option Order in TWS mit Bestätigung.
+    Returns: True wenn Order platziert, False sonst.
+    """
+    from ib_insync import Order
+    
+    if limit_price is None:
+        # Zuerst Marktdaten anfordern, dann Bid/Ask lesen
+        ib.reqMktData(option, '', False, False)
+        ib.sleep(2)  # Warten auf Marktdaten
+        
+        ticker = ib.ticker(option)
+        if ticker is None:
+            logger.warning(f"Kein Ticker für {option.localSymbol}")
+            return False
+            
+        limit_price = ticker.bid if action == 'SELL' else ticker.ask
+        ib.cancelMktData(option)
+    
+    if limit_price is None or limit_price <= 0:
+        logger.warning(f"Kein gültiger Limit-Preis für {option.localSymbol}")
+        return False
+    
+    order = Order()
+    order.action = action
+    order.orderType = order_type
+    order.totalQuantity = quantity
+    order.lmtPrice = round(limit_price, 2)
+    
+    if auto_transmit:
+        order.transmit = True
+        order.tif = 'DAY'  # Explizit DAY setzen um Error 10349 zu vermeiden
+        trade = ib.placeOrder(option, order)
+        ib.sleep(1)
+        logger.info(f"Auto-Order platziert: {trade.orderStatus.status}")
+        print(f"✅ Auto-Order gesendet: {option.localSymbol} @ ${limit_price:.2f} ({trade.orderStatus.status})")
+        return True
+    else:
+        order.transmit = False  # Nicht sofort senden
+        
+        # Trade Objekt erstellen (aber nicht senden)
+        trade = ib.placeOrder(option, order)
+        
+        # Bestätigung anfordern
+        print(f"\n{'='*60}")
+        print(f"ORDER BESTÄTIGUNG")
+        print(f"{'='*60}")
+        print(f"Symbol:     {option.symbol}")
+        print(f"Expiration: {option.lastTradeDateOrContractMonth}")
+        print(f"Strike:     {option.strike}")
+        print(f"Right:      {option.right}")
+        print(f"Action:     {action}")
+        print(f"Quantity:   {quantity}")
+        print(f"OrderType:  {order_type}")
+        print(f"LimitPrice: ${limit_price:.2f}")
+        print(f"Contract:   {option.localSymbol}")
+        print(f"{'='*60}")
+        
+        while True:
+            confirm = input("Order platzieren? (y/n): ").strip().lower()
+            if confirm in ['y', 'yes', 'j', 'ja']:
+                trade.transmit = True
+                ib.sleep(1)
+                logger.info(f"Order platziert: {trade.orderStatus.status}")
+                return True
+            elif confirm in ['n', 'no', 'nein']:
+                ib.cancelOrder(trade.order)
+                logger.info("Order abgebrochen")
+                return False
+            else:
+                print("Bitte 'y' oder 'n' eingeben.")
+
+
 def write_master_csv(results, filepath):
     with open(filepath, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=HEADERS)
@@ -207,7 +281,7 @@ def write_master_csv(results, filepath):
                 writer.writerow(out_row)
 
 
-def process_symbol(symbol, month_indices, exchange, currency, client_id):
+def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False):
     """Verarbeitet ein einzelnes Symbol"""
     ib = None
     try:
@@ -255,7 +329,7 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id):
         all_rows.sort(key=lambda x: x.get('put_profit', 0), reverse=True)
         top5 = all_rows[:5]
         
-        return {
+        result = {
             'symbol': symbol,
             'stock_price': stock_data['last'] or stock_data['close'],
             'currency': currency,
@@ -264,16 +338,18 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id):
             'top5': top5
         }
         
+        if keep_connected:
+            result['ib'] = ib
+            ib = None  # Don't disconnect in finally
+        
+        return result
+        
     except Exception as e:
         logger.error(f"{symbol} failed: {e}")
         return {'symbol': symbol, 'error': str(e)}
     finally:
         if ib and ib.isConnected():
             ib.disconnect()
-
-
-def filter_by_delta(rows, min_delta=-0.50, max_delta=-0.10):
-    return [r for r in rows if r['delta'] is not None and min_delta <= r['delta'] <= max_delta]
 
 
 def write_master_csv(results, filepath):
@@ -339,6 +415,7 @@ def main():
     logger.info(f"Month indices: {month_indices}")
     
     results = []
+    last_ib = None
     for i, symbol in enumerate(symbols):
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing {symbol} ({i+1}/{len(symbols)})...")
@@ -347,13 +424,17 @@ def main():
         ex = exchange if exchange != 'SMART' else defaults['exchange']
         cur = currency if currency != 'USD' else defaults['currency']
         
-        result = process_symbol(symbol, month_indices, ex, cur, 100 + i)
+        # Keep connection alive for the LAST symbol to reuse for orders
+        keep_conn = (i == len(symbols) - 1)
+        result = process_symbol(symbol, month_indices, ex, cur, 100 + i, keep_connected=keep_conn)
         results.append(result)
         
         if 'error' in result:
             logger.error(f"{symbol}: {result['error']}")
         else:
             logger.info(f"{symbol}: {len(result['top5'])} top options, stock={result['stock_price']} {result['currency']}")
+            if keep_conn and 'ib' in result:
+                last_ib = result['ib']
     
     # Master CSV
     write_master_csv(results, csv_file)
@@ -380,7 +461,57 @@ def main():
             exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
             print(f"{r['strike']:>8.1f} | {exp_short:>10} | {r['delta']:>7.4f} | {r['bid']:>6.2f} | {r['ask']:>6.2f} | {r['volume']:>5.0f} | {r['impliedVol']:>6.2%} | {r['put_profit']:>7.2f}%")
     
-    print(f"\n✅ Master CSV: {csv_file}")
+    # Collect all top options for auto-order
+    all_top_options = []
+    for res in results:
+        if 'error' in res:
+            continue
+        for r in res['top5']:
+            all_top_options.append(r)
+    
+    # Interaktive Order-Platzierung - auto-place best PUT per Symbol
+    print(f"\n{'='*80}")
+    print(f"AUTO-ORDER: Best PUT Options per Symbol")
+    print(f"{'='*80}")
+    
+    # Find best option per symbol
+    for symbol in ['MU', 'PLTR', 'CROX']:
+        symbol_options = [r for r in all_top_options if r['symbol'] == symbol]
+        if not symbol_options:
+            print(f"⚠️ Keine {symbol} Optionen gefunden.")
+            continue
+            
+        best = max(symbol_options, key=lambda x: x['put_profit'])
+        print(f"\nBeste {symbol} Option: {best['symbol']} {best['strike']:.0f}P {best['expiration'][4:]}")
+        print(f"Delta={best['delta']:.4f} | Bid=${best['bid']:.2f} | Put_Profit={best['put_profit']:.2f}%")
+        
+        # Use last connection
+        ib = last_ib
+        if ib and ib.isConnected():
+            try:
+                # Restore option contract
+                defaults = SYMBOL_DEFAULTS.get(best['symbol'].upper(), {'exchange': 'SMART', 'currency': 'USD'})
+                exchange = defaults['exchange']
+                currency = defaults['currency']
+                
+                opt = Option(best['symbol'], best['expiration'], best['strike'], 'P', exchange, tradingClass=best['symbol'], multiplier=best['multiplier'])
+                ib.qualifyContracts(opt)
+                
+                # Auto-place order (SELL 1 contract at BID)
+                print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${best['bid']:.2f} LMT")
+                placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type='LMT', limit_price=best['bid'], auto_transmit=True)
+                if placed:
+                    print(f"✅ {symbol} PUT Order erfolgreich platziert!")
+                else:
+                    print(f"❌ {symbol} Order nicht platziert.")
+            except Exception as e:
+                logger.error(f"Auto-Order {symbol} fehlgeschlagen: {e}")
+                print(f"Fehler: {e}")
+        else:
+            print("⚠️ Keine aktive Connection für Auto-Order.")
+            break
+    
+    print(f"\n✅ Fertig!")
 
 
 if __name__ == '__main__':
