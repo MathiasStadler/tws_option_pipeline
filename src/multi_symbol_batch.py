@@ -447,6 +447,96 @@ def write_master_csv(results, filepath):
                 writer.writerow(out_row)
 
 
+def write_master_html(results, filepath):
+    """Erzeugt HTML-Report parallel zur CSV"""
+    html_path = filepath.replace('.csv', '.html')
+    
+    # Daten für HTML aufbereiten
+    rows = []
+    for res in results:
+        if 'error' in res:
+            continue
+        for r in res['top5']:
+            row = {}
+            for h in HEADERS:
+                val = r.get(h)
+                if h == 'put_profit':
+                    val = f'{val:.2f}%'
+                elif isinstance(val, float):
+                    if h in {'bid', 'ask', 'last', 'close', 'bidSize', 'askSize', 'high', 'low', 'openPrice'}:
+                        val = f'{val:.2f}'
+                    elif h in {'delta', 'gamma', 'theta', 'vega', 'impliedVol'}:
+                        val = f'{val:.6f}'
+                    else:
+                        val = f'{val:.6f}'
+                row[h] = val if val is not None else ''
+            rows.append(row)
+    
+    if not rows:
+        return
+    
+    html = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Option Scan Results</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 20px; background: #fafafa; }}
+        h1 {{ color: #333; }}
+        .meta {{ color: #666; margin-bottom: 20px; }}
+        table {{ border-collapse: collapse; width: 100%; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        th, td {{ padding: 10px 12px; text-align: right; border-bottom: 1px solid #eee; }}
+        th {{ background: #f5f5f5; font-weight: 600; text-align: right; }}
+        td.symbol {{ text-align: left; font-weight: 500; }}
+        td.expiration {{ text-align: center; }}
+        tr:hover {{ background: #fafafa; }}
+        .profit {{ font-weight: 600; color: #2e7d32; }}
+        .delta {{ color: #1565c0; }}
+        .symbol-group {{ background: #f9f9f9; }}
+    </style>
+</head>
+<body>
+    <h1>Multi-Symbol Option Scan</h1>
+    <p class="meta">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <table>
+        <thead>
+            <tr>
+                {''.join(f'<th>{h}</th>' for h in HEADERS)}
+            </tr>
+        </thead>
+        <tbody>
+"""
+    current_symbol = None
+    for row in rows:
+        sym = row.get('symbol', '')
+        if sym != current_symbol:
+            current_symbol = sym
+            html += f'        <tr class="symbol-group"><td colspan="{len(HEADERS)}"><strong>{sym}</strong></td></tr>\n'
+        html += '        <tr>\n'
+        for h, val in row.items():
+            cls = ''
+            if h == 'symbol':
+                cls = 'symbol'
+            elif h == 'expiration':
+                cls = 'expiration'
+            elif h == 'put_profit':
+                cls = 'profit'
+            elif h == 'delta':
+                cls = 'delta'
+            html += f'            <td class="{cls}">{val}</td>\n'
+        html += '        </tr>\n'
+    
+    html += """        </tbody>
+    </table>
+</body>
+</html>"""
+    
+    with open(html_path, 'w') as f:
+        f.write(html)
+    
+    logger.info(f"HTML Report: {html_path}")
+
+
 def main():
     default_symbols = ['CROX', 'AAPL', 'TREX', 'TSLA', 'NVDA']
     default_month_indices = [0, 1, 2]
@@ -461,7 +551,7 @@ def main():
         for arg in args:
             if arg.isdigit():
                 month_indices.append(int(arg))
-            elif arg in ['SMART', 'XETRA', 'AEB', 'NYSE', 'NASDAQ']:
+            elif arg in ['SMART', 'XETRA', 'AEB', 'NYSE', 'NASDAQ', 'FWB', 'IBIS']:
                 exchange = arg
             elif arg in ['USD', 'EUR']:
                 currency = arg
@@ -509,6 +599,7 @@ def main():
     
     # Master CSV
     write_master_csv(results, csv_file)
+    write_master_html(results, csv_file)
     logger.info(f"Master CSV: {csv_file}")
     
     # Summary
@@ -545,11 +636,10 @@ def main():
     print(f"AUTO-ORDER: Best PUT Options per Symbol")
     print(f"{'='*80}")
     
-    # Find best option per symbol
-    for symbol in ['MU', 'PLTR', 'CROX']:
+    # Find best option per symbol - nur für gescannte Symbole
+    for symbol in symbols:
         symbol_options = [r for r in all_top_options if r['symbol'] == symbol]
         if not symbol_options:
-            print(f"⚠️ Keine {symbol} Optionen gefunden.")
             continue
             
         best = max(symbol_options, key=lambda x: x['put_profit'])
@@ -568,9 +658,26 @@ def main():
                 opt = Option(best['symbol'], best['expiration'], best['strike'], 'P', exchange, tradingClass=best['symbol'], multiplier=best['multiplier'])
                 ib.qualifyContracts(opt)
                 
-                # Auto-place order (SELL 1 contract at BID)
-                print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${best['bid']:.2f} LMT")
-                placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type='LMT', limit_price=best['bid'], auto_transmit=True)
+                # Auto-place order (SELL 1 contract at MARK - 0.05) mit Bestätigung
+                # Marktdaten anfordern für Mark Price
+                ib.reqMktData(opt, '', False, False)
+                ib.sleep(2)
+                ticker = ib.ticker(opt)
+                # Fallback-Kette: markPrice -> mid (bid+ask)/2 -> close -> bid
+                mark_price = None
+                if hasattr(ticker, 'markPrice') and ticker.markPrice and not math.isnan(ticker.markPrice):
+                    mark_price = ticker.markPrice
+                elif ticker.bid and ticker.ask and ticker.bid > 0 and ticker.ask > 0:
+                    mark_price = (ticker.bid + ticker.ask) / 2
+                elif ticker.close and ticker.close > 0:
+                    mark_price = ticker.close
+                else:
+                    mark_price = ticker.bid
+                ib.cancelMktData(opt)
+                
+                limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
+                print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type='LMT', limit_price=limit_price, auto_transmit=False)
                 if placed:
                     print(f"✅ {symbol} PUT Order erfolgreich platziert!")
                 else:
