@@ -252,10 +252,10 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     """
     from ib_insync import Order
     
-    # Für MID Orders: kein Limit-Preis nötig, Order-Type = MID
-    if order_type == 'MID':
-        order_type = 'MID'
-        limit_price = None  # MID orders haben keinen Limit-Preis
+    # Für REL Orders (Pegged-to-Midpoint): kein Limit-Preis, auxPrice=0 für Midpoint
+    if order_type == 'REL':
+        order_type = 'REL'
+        limit_price = None  # REL orders haben keinen Limit-Preis
     else:
         order_type = 'LMT'
         if limit_price is None:
@@ -276,9 +276,9 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
             return False
     
     # MARGIN CHECK vor Auto-Order
-    # Für MID Orders: Margin basierend auf Mid-Preis prüfen
+    # Für REL Orders: Margin basierend auf Mid-Preis prüfen
     check_price = limit_price
-    if order_type == 'MID' and check_price is None:
+    if order_type == 'REL' and check_price is None:
         # Mid-Preis für Margin-Check holen
         ib.reqMktData(option, '', False, False)
         ib.sleep(2)
@@ -303,6 +303,8 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     order.totalQuantity = quantity
     if order_type == 'LMT':
         order.lmtPrice = round(limit_price, 2)
+    elif order_type == 'REL':
+        order.auxPrice = 0  # Offset 0 = Midpoint
     order.tif = 'DAY'  # Explizit DAY setzen um Error 10349 zu vermeiden
     
     if auto_transmit:
@@ -328,7 +330,12 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
         print(f"Action:     {action}")
         print(f"Quantity:   {quantity}")
         print(f"OrderType:  {order_type}")
-        print(f"LimitPrice: ${limit_price:.2f}")
+        if order_type == 'LMT' and limit_price is not None:
+            print(f"LimitPrice: ${limit_price:.2f}")
+        elif order_type == 'REL':
+            print(f"LimitPrice: REL (Pegged-to-Midpoint, Offset=0)")
+        else:
+            print(f"LimitPrice: MID (Market Mid-Price)")
         print(f"Contract:   {option.localSymbol}")
         print(f"{'='*60}")
         
@@ -579,7 +586,7 @@ def main():
     delta_min = -0.50
     delta_max = -0.10
     num_chains = 0  # 0 = auto (use month_indices or default)
-    order_type = 'LMT'  # LMT or MID
+    order_type = 'LMT'  # LMT or REL
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         symbols = []
@@ -605,8 +612,8 @@ def main():
                 i += 1
             elif arg in ['--order-type', '--ot'] and i + 1 < len(args):
                 order_type = args[i + 1].upper()
-                if order_type not in ['LMT', 'MID']:
-                    print(f"Error: --order-type must be LMT or MID, got {order_type}")
+                if order_type not in ['LMT', 'REL']:
+                    print(f"Error: --order-type must be LMT or REL, got {order_type}")
                     sys.exit(1)
                 i += 1
             else:
@@ -746,7 +753,7 @@ def main():
                             opt = Option(selected['symbol'], selected['expiration'], selected['strike'], 'P', exchange, tradingClass=selected['symbol'], multiplier=selected['multiplier'])
                             ib.qualifyContracts(opt)
                         
-                            # Get mark price
+                            # Get mark price for display purposes (even for REL orders)
                             ib.reqMktData(opt, '', False, False)
                             ib.sleep(2)
                             ticker = ib.ticker(opt)
@@ -761,8 +768,13 @@ def main():
                                 mark_price = ticker.bid
                             ib.cancelMktData(opt)
                         
-                            limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
-                            print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} {order_type} (Mark: ${mark_price:.2f} - $0.05)")
+                            if order_type == 'LMT':
+                                limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
+                                print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                            else:
+                                limit_price = None
+                                mid_price = mark_price if mark_price and mark_price > 0 else selected['bid']
+                                print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
                             placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type=order_type, limit_price=limit_price, auto_transmit=False)
                             if placed:
                                 print(f"✅ {selected['symbol']} PUT Order erfolgreich platziert!")
@@ -820,8 +832,13 @@ def main():
                             mark_price = ticker.bid
                         ib.cancelMktData(opt)
                     
-                        limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
-                        print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} {order_type} (Mark: ${mark_price:.2f} - $0.05)")
+                        if order_type == 'LMT':
+                            limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
+                            print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                        else:
+                            limit_price = None
+                            mid_price = mark_price if mark_price and mark_price > 0 else best['bid']
+                            print(f">>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
                         placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type=order_type, limit_price=limit_price, auto_transmit=False)
                         if placed:
                             print(f"✅ {symbol} PUT Order erfolgreich platziert!")

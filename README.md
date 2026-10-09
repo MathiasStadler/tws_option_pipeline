@@ -121,7 +121,37 @@ CSV-Datei in `/home/hermes/tws_option_pipeline/src/tws_option_contracts_<SYMBOL>
 /home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py ZIM \
   --manual \
   --order-type MID \
-  --num-chains 5 \
+  --num-chains 3 \
   --delta-min -0.30 \
   --delta-max -0.10 \
   0 1 SMART USD
+
+## IBM
+
+# Standard (LMT, Delta -0.50 bis -0.10, erste 2 Expirations)
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py IBM 0 1 SMART USD
+
+# MID Order Type
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py IBM --order-type MID 0 1 SMART USD
+
+# Kurzform
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py IBM --ot MID 0 1 SMART USD
+
+# Manual Mode + MID + 3 Chains + Delta Range
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py IBM -m --ot MID --chains 3 --delta-min -0.30 --delta-max -0.10 0 1 SMART USD
+
+# Alle Parameter explizit
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py IBM \
+  --manual \
+  --order-type MID \
+  --num-chains 3 \
+  --delta-min -0.30 \
+  --delta-max -0.10 \
+  0 1 SMART USD
+
+
+# Korrekt (REL = Pegged-to-Midpoint)
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py IBM -m --order-type REL --chains 3 --delta-min -0.30 --delta-max -0.10 0 1 SMART USD
+
+# Kurzform
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py IBM -m --ot REL --chains 3 --dmin -0.30 --dmax -0.10 0 1 SMART USD
