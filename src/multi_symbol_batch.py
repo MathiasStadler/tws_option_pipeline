@@ -252,26 +252,45 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     """
     from ib_insync import Order
     
-    if limit_price is None:
-        # Zuerst Marktdaten anfordern, dann Bid/Ask lesen
-        ib.reqMktData(option, '', False, False)
-        ib.sleep(2)  # Warten auf Marktdaten
-        
-        ticker = ib.ticker(option)
-        if ticker is None:
-            logger.warning(f"Kein Ticker für {option.localSymbol}")
-            return False
+    # Für MID Orders: kein Limit-Preis nötig, Order-Type = MID
+    if order_type == 'MID':
+        order_type = 'MID'
+        limit_price = None  # MID orders haben keinen Limit-Preis
+    else:
+        order_type = 'LMT'
+        if limit_price is None:
+            # Zuerst Marktdaten anfordern, dann Bid/Ask lesen
+            ib.reqMktData(option, '', False, False)
+            ib.sleep(2)  # Warten auf Marktdaten
             
-        limit_price = ticker.bid if action == 'SELL' else ticker.ask
-        ib.cancelMktData(option)
-    
-    if limit_price is None or limit_price <= 0:
-        logger.warning(f"Kein gültiger Limit-Preis für {option.localSymbol}")
-        return False
+            ticker = ib.ticker(option)
+            if ticker is None:
+                logger.warning(f"Kein Ticker für {option.localSymbol}")
+                return False
+                
+            limit_price = ticker.bid if action == 'SELL' else ticker.ask
+            ib.cancelMktData(option)
+        
+        if limit_price is None or limit_price <= 0:
+            logger.warning(f"Kein gültiger Limit-Preis für {option.localSymbol}")
+            return False
     
     # MARGIN CHECK vor Auto-Order
+    # Für MID Orders: Margin basierend auf Mid-Preis prüfen
+    check_price = limit_price
+    if order_type == 'MID' and check_price is None:
+        # Mid-Preis für Margin-Check holen
+        ib.reqMktData(option, '', False, False)
+        ib.sleep(2)
+        ticker = ib.ticker(option)
+        if ticker.bid and ticker.ask and ticker.bid > 0 and ticker.ask > 0:
+            check_price = (ticker.bid + ticker.ask) / 2
+        else:
+            check_price = ticker.bid or ticker.close
+        ib.cancelMktData(option)
+    
     if auto_transmit and action == 'SELL' and option.right == 'P':
-        ok, required, available, msg = check_margin(ib, option, quantity, limit_price)
+        ok, required, available, msg = check_margin(ib, option, quantity, check_price)
         print(f"🔍 Margin Check: {msg}")
         if not ok:
             logger.warning(f"Margin Check fehlgeschlagen: {msg}")
@@ -282,7 +301,8 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     order.action = action
     order.orderType = order_type
     order.totalQuantity = quantity
-    order.lmtPrice = round(limit_price, 2)
+    if order_type == 'LMT':
+        order.lmtPrice = round(limit_price, 2)
     order.tif = 'DAY'  # Explizit DAY setzen um Error 10349 zu vermeiden
     
     if auto_transmit:
@@ -351,7 +371,7 @@ def write_master_csv(results, filepath):
                 writer.writerow(out_row)
 
 
-def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0):
+def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT'):
     """Verarbeitet ein einzelnes Symbol"""
     ib = None
     try:
@@ -559,6 +579,7 @@ def main():
     delta_min = -0.50
     delta_max = -0.10
     num_chains = 0  # 0 = auto (use month_indices or default)
+    order_type = 'LMT'  # LMT or MID
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         symbols = []
@@ -581,6 +602,12 @@ def main():
                 i += 1
             elif arg in ['--chains', '--num-chains'] and i + 1 < len(args):
                 num_chains = int(args[i + 1])
+                i += 1
+            elif arg in ['--order-type', '--ot'] and i + 1 < len(args):
+                order_type = args[i + 1].upper()
+                if order_type not in ['LMT', 'MID']:
+                    print(f"Error: --order-type must be LMT or MID, got {order_type}")
+                    sys.exit(1)
                 i += 1
             else:
                 filtered_args.append(arg)
@@ -627,7 +654,7 @@ def main():
         
         # Keep connection alive for the LAST symbol to reuse for orders
         keep_conn = (i == len(symbols) - 1)
-        result = process_symbol(symbol, month_indices, ex, cur, 100 + i, keep_connected=keep_conn, delta_min=delta_min, delta_max=delta_max, num_chains=num_chains)
+        result = process_symbol(symbol, month_indices, ex, cur, 100 + i, keep_connected=keep_conn, delta_min=delta_min, delta_max=delta_max, num_chains=num_chains, order_type=order_type)
         results.append(result)
         
         if 'error' in result:
@@ -735,8 +762,8 @@ def main():
                             ib.cancelMktData(opt)
                         
                             limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
-                            print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
-                            placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type='LMT', limit_price=limit_price, auto_transmit=False)
+                            print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} {order_type} (Mark: ${mark_price:.2f} - $0.05)")
+                            placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type=order_type, limit_price=limit_price, auto_transmit=False)
                             if placed:
                                 print(f"✅ {selected['symbol']} PUT Order erfolgreich platziert!")
                             else:
@@ -794,8 +821,8 @@ def main():
                         ib.cancelMktData(opt)
                     
                         limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
-                        print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
-                        placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type='LMT', limit_price=limit_price, auto_transmit=False)
+                        print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} {order_type} (Mark: ${mark_price:.2f} - $0.05)")
+                        placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type=order_type, limit_price=limit_price, auto_transmit=False)
                         if placed:
                             print(f"✅ {symbol} PUT Order erfolgreich platziert!")
                         else:

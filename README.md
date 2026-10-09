@@ -104,3 +104,24 @@ CSV-Datei in `/home/hermes/tws_option_pipeline/src/tws_option_contracts_<SYMBOL>
 
 
 /home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py FAST --chains 3 --delta-min -0.30 --delta-max -0.10 -m 0 1 SMART USD
+
+# Standard (LMT, Delta -0.50 bis -0.10, erste 2 Expirations)
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py ZIM 0 1 SMART USD
+
+# MID Order Type
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py ZIM --order-type MID 0 1 SMART USD
+
+# Kurzform
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py ZIM --ot MID 0 1 SMART USD
+
+# Manual Mode + MID + 5 Chains + Delta Range
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py ZIM -m --ot MID --chains 5 --delta-min -0.30 --delta-max -0.10 0 1 SMART USD
+
+# Alle Parameter explizit
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py ZIM \
+  --manual \
+  --order-type MID \
+  --num-chains 5 \
+  --delta-min -0.30 \
+  --delta-max -0.10 \
+  0 1 SMART USD
