@@ -183,6 +183,68 @@ def filter_by_delta(rows, min_delta=-0.50, max_delta=-0.10):
     return [r for r in rows if r['delta'] is not None and min_delta <= r['delta'] <= max_delta]
 
 
+def check_margin(ib, option, quantity=1, price=None):
+    """
+    Prüft ob genügend Margin für Short PUT verfügbar ist.
+    Verwendet whatIfOrder für exakte Margin-Berechnung.
+    Returns: (ok: bool, required_margin: float, available: float, msg: str)
+    """
+    from ib_insync import Order
+    
+    # Account Summary holen
+    acct = ib.accountSummary()
+    available = 0.0
+    for v in acct:
+        if v.tag == 'AvailableFunds':
+            available = float(v.value)
+            break
+    
+    if available <= 0:
+        return False, 0, 0, "Keine AvailableFunds gefunden"
+    
+    # WhatIf Order für Margin-Check
+    test_order = Order()
+    test_order.action = 'SELL'
+    test_order.orderType = 'LMT'
+    test_order.totalQuantity = quantity
+    test_order.lmtPrice = round(price, 2) if price else 0
+    test_order.tif = 'DAY'
+    test_order.whatIf = True  # WICHTIG: nur Simulierung
+    
+    try:
+        whatif_trade = ib.placeOrder(option, test_order)
+        ib.sleep(1.5)  # Warten auf Margin-Berechnung
+        
+        # Margin aus whatIf Trade lesen
+        required = 0.0
+        if whatif_trade.orderStatus.marginChange is not None:
+            required = abs(whatif_trade.orderStatus.marginChange)
+        elif whatif_trade.orderStatus.initMarginChange is not None:
+            required = abs(whatif_trade.orderStatus.initMarginChange)
+        elif whatif_trade.orderStatus.maintMarginChange is not None:
+            required = abs(whatif_trade.orderStatus.maintMarginChange)
+        
+        # Fallback: Rough estimate für Short PUT (~20% von Strike * 100)
+        if required == 0 and price:
+            required = option.strike * 100 * 0.20
+        
+        # Safety buffer: nur 80% der verfügbaren Funds nutzen
+        max_allowed = available * 0.80
+        
+        if required > max_allowed:
+            return False, required, available, f"Margin ${required:,.0f} > 80% Available ${max_allowed:,.0f}"
+        
+        return True, required, available, f"OK: Margin ${required:,.0f} <= ${max_allowed:,.0f}"
+        
+    except Exception as e:
+        # Fallback auf Schätzung
+        est_required = option.strike * 100 * 0.20 if price else 0
+        max_allowed = available * 0.80
+        if est_required > max_allowed:
+            return False, est_required, available, f"Est. Margin ${est_required:,.0f} > 80% Available ${max_allowed:,.0f}"
+        return True, est_required, available, f"Est. OK: ${est_required:,.0f} <= ${max_allowed:,.0f}"
+
+
 def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', limit_price=None, auto_transmit=False):
     """
     Platziert eine Option Order in TWS mit Bestätigung.
@@ -206,6 +268,15 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     if limit_price is None or limit_price <= 0:
         logger.warning(f"Kein gültiger Limit-Preis für {option.localSymbol}")
         return False
+    
+    # MARGIN CHECK vor Auto-Order
+    if auto_transmit and action == 'SELL' and option.right == 'P':
+        ok, required, available, msg = check_margin(ib, option, quantity, limit_price)
+        print(f"🔍 Margin Check: {msg}")
+        if not ok:
+            logger.warning(f"Margin Check fehlgeschlagen: {msg}")
+            print(f"❌ Order übersprungen: {msg}")
+            return False
     
     order = Order()
     order.action = action
