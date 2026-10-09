@@ -283,10 +283,9 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     order.orderType = order_type
     order.totalQuantity = quantity
     order.lmtPrice = round(limit_price, 2)
+    order.tif = 'DAY'  # Explizit DAY setzen um Error 10349 zu vermeiden
     
     if auto_transmit:
-        order.transmit = True
-        order.tif = 'DAY'  # Explizit DAY setzen um Error 10349 zu vermeiden
         trade = ib.placeOrder(option, order)
         ib.sleep(1)
         logger.info(f"Auto-Order platziert: {trade.orderStatus.status}")
@@ -352,7 +351,7 @@ def write_master_csv(results, filepath):
                 writer.writerow(out_row)
 
 
-def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False):
+def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0):
     """Verarbeitet ein einzelnes Symbol"""
     ib = None
     try:
@@ -363,6 +362,20 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
         stock_price = stock_data['last'] or stock_data['close']
         logger.info(f"{symbol}: Stock @ {stock_price} {currency}")
         
+        # If num_chains specified, get all available expirations and use first N
+        if num_chains > 0:
+            all_chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
+            chain = [c for c in all_chains if c.exchange == exchange]
+            if not chain:
+                chain = [c for c in all_chains if c.expirations]
+            if chain:
+                chain = chain[0]
+                available_expirations = chain.expirations[:num_chains]
+                logger.info(f"  Using first {num_chains} of {len(chain.expirations)} available chains: {available_expirations}")
+                month_indices = list(range(len(available_expirations)))
+            else:
+                available_expirations = []
+        
         all_rows = []
         
         for month_idx in month_indices:
@@ -370,7 +383,7 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
                 _, chain, expiration = get_stock_and_chain(ib, symbol, month_idx, exchange, currency)
                 stock_price = stock_data['last'] or stock_data['close']
                 
-                min_strike, max_strike = get_strike_range_for_delta(chain, stock_price, expiration)
+                min_strike, max_strike = get_strike_range_for_delta(chain, stock_price, expiration, min_delta=delta_min, max_delta=delta_max)
                 if min_strike is None:
                     logger.warning(f"  {symbol} {expiration}: Keine Strikes im Delta-Bereich")
                     continue
@@ -380,7 +393,7 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
                     continue
                 
                 rows = fetch_option_greeks_batch(ib, options)
-                filtered = filter_by_delta(rows)
+                filtered = filter_by_delta(rows, min_delta=delta_min, max_delta=delta_max)
                 
                 for r in filtered:
                     r['expiration'] = expiration
@@ -541,12 +554,39 @@ def main():
     default_symbols = ['CROX', 'AAPL', 'TREX', 'TSLA', 'NVDA']
     default_month_indices = [0, 1, 2]
     
+    # Argument parsing
+    manual_mode = False
+    delta_min = -0.50
+    delta_max = -0.10
+    num_chains = 0  # 0 = auto (use month_indices or default)
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         symbols = []
         month_indices = []
         exchange = 'SMART'
         currency = 'USD'
+        
+        # Filter out -m/--manual flag
+        filtered_args = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg in ['-m', '--manual']:
+                manual_mode = True
+            elif arg in ['--delta-min', '--dmin'] and i + 1 < len(args):
+                delta_min = float(args[i + 1])
+                i += 1
+            elif arg in ['--delta-max', '--dmax'] and i + 1 < len(args):
+                delta_max = float(args[i + 1])
+                i += 1
+            elif arg in ['--chains', '--num-chains'] and i + 1 < len(args):
+                num_chains = int(args[i + 1])
+                i += 1
+            else:
+                filtered_args.append(arg)
+            i += 1
+        
+        args = filtered_args
         
         for arg in args:
             if arg.isdigit():
@@ -560,7 +600,7 @@ def main():
         
         if not symbols:
             symbols = default_symbols
-        if not month_indices:
+        if not month_indices and num_chains == 0:
             month_indices = default_month_indices
     else:
         symbols = default_symbols
@@ -587,7 +627,7 @@ def main():
         
         # Keep connection alive for the LAST symbol to reuse for orders
         keep_conn = (i == len(symbols) - 1)
-        result = process_symbol(symbol, month_indices, ex, cur, 100 + i, keep_connected=keep_conn)
+        result = process_symbol(symbol, month_indices, ex, cur, 100 + i, keep_connected=keep_conn, delta_min=delta_min, delta_max=delta_max, num_chains=num_chains)
         results.append(result)
         
         if 'error' in result:
@@ -624,72 +664,150 @@ def main():
             print(f"{r['strike']:>8.1f} | {exp_short:>10} | {r['delta']:>7.4f} | {r['bid']:>6.2f} | {r['ask']:>6.2f} | {r['volume']:>5.0f} | {r['impliedVol']:>6.2%} | {r['put_profit']:>7.2f}%")
     
     # Collect all top options for auto-order
-    all_top_options = []
-    for res in results:
-        if 'error' in res:
-            continue
-        for r in res['top5']:
-            all_top_options.append(r)
+        all_top_options = []
+        for res in results:
+            if 'error' in res:
+                continue
+            for r in res['top5']:
+                all_top_options.append(r)
     
-    # Interaktive Order-Platzierung - auto-place best PUT per Symbol
-    print(f"\n{'='*80}")
-    print(f"AUTO-ORDER: Best PUT Options per Symbol")
-    print(f"{'='*80}")
-    
-    # Find best option per symbol - nur für gescannte Symbole
-    for symbol in symbols:
-        symbol_options = [r for r in all_top_options if r['symbol'] == symbol]
-        if not symbol_options:
-            continue
-            
-        best = max(symbol_options, key=lambda x: x['put_profit'])
-        print(f"\nBeste {symbol} Option: {best['symbol']} {best['strike']:.0f}P {best['expiration'][4:]}")
-        print(f"Delta={best['delta']:.4f} | Bid=${best['bid']:.2f} | Put_Profit={best['put_profit']:.2f}%")
+        if manual_mode:
+            # MANUAL MODE: User selects which option(s) to trade
+            print(f"\n{'='*80}")
+            print(f"MANUAL MODE: Wählen Sie Option(en) zum Handeln")
+            print(f"{'='*80}")
         
-        # Use last connection
-        ib = last_ib
-        if ib and ib.isConnected():
-            try:
-                # Restore option contract
-                defaults = SYMBOL_DEFAULTS.get(best['symbol'].upper(), {'exchange': 'SMART', 'currency': 'USD'})
-                exchange = defaults['exchange']
-                currency = defaults['currency']
+            # Show all options with numbers
+            print(f"\nVerfügbare Optionen (Top 5 pro Symbol):")
+            for idx, r in enumerate(all_top_options):
+                exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
+                # Calculate DTE (Days to Expiration)
+                try:
+                    exp_date = datetime.strptime(r['expiration'], '%Y%m%d')
+                    dte = (exp_date - datetime.now()).days
+                except:
+                    dte = '?'
+                print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
+        
+            print(f"\nEingabe: Nummern (z.B. '1', '1,3', '1 3') oder 'q' zum Beenden")
+        
+            ib = last_ib
+            if not ib or not ib.isConnected():
+                print("⚠️ Keine aktive Connection für Order.")
+            else:
+                while True:
+                    choice = input("\nOption(en) wählen: ").strip().lower()
+                    if choice in ['q', 'quit', 'exit']:
+                        break
                 
-                opt = Option(best['symbol'], best['expiration'], best['strike'], 'P', exchange, tradingClass=best['symbol'], multiplier=best['multiplier'])
-                ib.qualifyContracts(opt)
-                
-                # Auto-place order (SELL 1 contract at MARK - 0.05) mit Bestätigung
-                # Marktdaten anfordern für Mark Price
-                ib.reqMktData(opt, '', False, False)
-                ib.sleep(2)
-                ticker = ib.ticker(opt)
-                # Fallback-Kette: markPrice -> mid (bid+ask)/2 -> close -> bid
-                mark_price = None
-                if hasattr(ticker, 'markPrice') and ticker.markPrice and not math.isnan(ticker.markPrice):
-                    mark_price = ticker.markPrice
-                elif ticker.bid and ticker.ask and ticker.bid > 0 and ticker.ask > 0:
-                    mark_price = (ticker.bid + ticker.ask) / 2
-                elif ticker.close and ticker.close > 0:
-                    mark_price = ticker.close
-                else:
-                    mark_price = ticker.bid
-                ib.cancelMktData(opt)
-                
-                limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
-                print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
-                placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type='LMT', limit_price=limit_price, auto_transmit=False)
-                if placed:
-                    print(f"✅ {symbol} PUT Order erfolgreich platziert!")
-                else:
-                    print(f"❌ {symbol} Order nicht platziert.")
-            except Exception as e:
-                logger.error(f"Auto-Order {symbol} fehlgeschlagen: {e}")
-                print(f"Fehler: {e}")
+                    parts = choice.replace(',', ' ').split()
+                    try:
+                        indices = [int(p) - 1 for p in parts]
+                        valid = [i for i in indices if 0 <= i < len(all_top_options)]
+                        invalid = [i for i in indices if i < 0 or i >= len(all_top_options)]
+                    
+                        if invalid:
+                            print(f"Ungültige Nummern: {[i+1 for i in invalid]}. Gültig: 1-{len(all_top_options)}")
+                    
+                        for idx in valid:
+                            selected = all_top_options[idx]
+                            # Place order for selected option
+                            defaults = SYMBOL_DEFAULTS.get(selected['symbol'].upper(), {'exchange': 'SMART', 'currency': 'USD'})
+                            exchange = defaults['exchange']
+                            currency = defaults['currency']
+                        
+                            opt = Option(selected['symbol'], selected['expiration'], selected['strike'], 'P', exchange, tradingClass=selected['symbol'], multiplier=selected['multiplier'])
+                            ib.qualifyContracts(opt)
+                        
+                            # Get mark price
+                            ib.reqMktData(opt, '', False, False)
+                            ib.sleep(2)
+                            ticker = ib.ticker(opt)
+                            mark_price = None
+                            if hasattr(ticker, 'markPrice') and ticker.markPrice and not math.isnan(ticker.markPrice):
+                                mark_price = ticker.markPrice
+                            elif ticker.bid and ticker.ask and ticker.bid > 0 and ticker.ask > 0:
+                                mark_price = (ticker.bid + ticker.ask) / 2
+                            elif ticker.close and ticker.close > 0:
+                                mark_price = ticker.close
+                            else:
+                                mark_price = ticker.bid
+                            ib.cancelMktData(opt)
+                        
+                            limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
+                            print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                            placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type='LMT', limit_price=limit_price, auto_transmit=False)
+                            if placed:
+                                print(f"✅ {selected['symbol']} PUT Order erfolgreich platziert!")
+                            else:
+                                print(f"❌ {selected['symbol']} Order nicht platziert.")
+                    
+                        if valid:
+                            # Refresh positions
+                            pass
+                        
+                    except ValueError:
+                        print("Eingabe: Nummern (z.B. '1', '1,3', '1 3') oder 'q'")
         else:
-            print("⚠️ Keine aktive Connection für Auto-Order.")
-            break
+            # AUTO MODE: Best PUT per Symbol
+            print(f"\n{'='*80}")
+            print(f"AUTO-ORDER: Best PUT Options per Symbol")
+            print(f"{'='*80}")
+        
+            # Find best option per symbol - nur für gescannte Symbole
+            for symbol in symbols:
+                symbol_options = [r for r in all_top_options if r['symbol'] == symbol]
+                if not symbol_options:
+                    continue
+            
+                best = max(symbol_options, key=lambda x: x['put_profit'])
+                print(f"\nBeste {symbol} Option: {best['symbol']} {best['strike']:.0f}P {best['expiration'][4:]}")
+                print(f"Delta={best['delta']:.4f} | Bid=${best['bid']:.2f} | Put_Profit={best['put_profit']:.2f}%")
+            
+                # Use last connection
+                ib = last_ib
+                if ib and ib.isConnected():
+                    try:
+                        # Restore option contract
+                        defaults = SYMBOL_DEFAULTS.get(best['symbol'].upper(), {'exchange': 'SMART', 'currency': 'USD'})
+                        exchange = defaults['exchange']
+                        currency = defaults['currency']
+                    
+                        opt = Option(best['symbol'], best['expiration'], best['strike'], 'P', exchange, tradingClass=best['symbol'], multiplier=best['multiplier'])
+                        ib.qualifyContracts(opt)
+                    
+                        # Auto-place order (SELL 1 contract at MARK - 0.05) mit Bestätigung
+                        # Marktdaten anfordern für Mark Price
+                        ib.reqMktData(opt, '', False, False)
+                        ib.sleep(2)
+                        ticker = ib.ticker(opt)
+                        # Fallback-Kette: markPrice -> mid (bid+ask)/2 -> close -> bid
+                        mark_price = None
+                        if hasattr(ticker, 'markPrice') and ticker.markPrice and not math.isnan(ticker.markPrice):
+                            mark_price = ticker.markPrice
+                        elif ticker.bid and ticker.ask and ticker.bid > 0 and ticker.ask > 0:
+                            mark_price = (ticker.bid + ticker.ask) / 2
+                        elif ticker.close and ticker.close > 0:
+                            mark_price = ticker.close
+                        else:
+                            mark_price = ticker.bid
+                        ib.cancelMktData(opt)
+                    
+                        limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
+                        print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                        placed = place_option_order(ib, opt, action='SELL', quantity=1, order_type='LMT', limit_price=limit_price, auto_transmit=False)
+                        if placed:
+                            print(f"✅ {symbol} PUT Order erfolgreich platziert!")
+                        else:
+                            print(f"❌ {symbol} Order nicht platziert.")
+                    except Exception as e:
+                        logger.error(f"Auto-Order {symbol} fehlgeschlagen: {e}")
+                        print(f"Fehler: {e}")
+                else:
+                    print("⚠️ Keine aktive Connection für Auto-Order.")
+                    break
     
-    print(f"\n✅ Fertig!")
+        print(f"\n✅ Fertig!")
 
 
 if __name__ == '__main__':

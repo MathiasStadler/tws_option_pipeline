@@ -82,3 +82,25 @@ CSV-Datei in `/home/hermes/tws_option_pipeline/src/tws_option_contracts_<SYMBOL>
 - **OpenInterest** = `nan` (Delayed Data bei Paper Trading)
 - Client IDs können erschöpft sein → TWS neu starten oder `clientId` in `connect_ib()` ändern
 - Für europäische Aktien (ALV, ASML) braucht man Market Data Subscription
+
+## work sample
+
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/close_position.py
+
+-close
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py ANET 0 1 S
+
+- open
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py ANET 0 1 SMART USD
+
+# 3 Option Chains scannen
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py CRWD --chains 3 0 1 SMART USD
+
+# Kurzform
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py CRWD --num-chains 3 0 1 SMART USD
+
+# Kombiniert mit Delta-Range und Manual Mode
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py CRWD --chains 5 --delta-min -0.30 --delta-max -0.10 -m 0 1 SMART USD
+
+
+/home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py FAST --chains 3 --delta-min -0.30 --delta-max -0.10 -m 0 1 SMART USD
